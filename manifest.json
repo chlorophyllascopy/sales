@@ -1,0 +1,9 @@
+{
+  "name": "POS & Price Lookup",
+  "short_name": "POS",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f4f5f7",
+  "theme_color": "#2563eb"
+}

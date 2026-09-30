@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>POS & Price Lookup</title>
+<!-- Offline: put xlsx.full.min.js next to this file. Otherwise it loads from the CDN (needs internet once, then browser cache). -->
+<script src="xlsx.full.min.js" onerror="var s=document.createElement('script');s.src='https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';document.head.appendChild(s)"></script>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--ink:#1e2430;--mut:#6b7280;--acc:#2563eb;--ok:#16a34a;--bad:#dc2626;--line:#e5e7eb}
+@media(prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1b2029;--ink:#e8ecf3;--mut:#9aa4b2;--line:#2b3240}}
+*{box-sizing:border-box}body{margin:0;font:14px system-ui,sans-serif;background:var(--bg);color:var(--ink)}
+header{display:flex;gap:6px;align-items:center;padding:8px 12px;background:var(--card);border-bottom:1px solid var(--line);flex-wrap:wrap;position:sticky;top:0;z-index:5}
+header b{font-size:16px;margin-right:10px}
+button,select,input{font:inherit;color:inherit}
+button{border:1px solid var(--line);background:var(--card);border-radius:8px;padding:7px 12px;cursor:pointer}
+button.p{background:var(--acc);color:#fff;border-color:var(--acc)}button.g{background:var(--ok);color:#fff;border-color:var(--ok)}button.d{color:var(--bad)}
+nav button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+input,select{border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--card);max-width:100%}
+main{padding:12px;max-width:1300px;margin:auto}
+.grid{display:grid;grid-template-columns:1.2fr 1fr;gap:12px}@media(max-width:800px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:12px}
+#q{width:100%;font-size:18px;padding:12px}
+table{width:100%;border-collapse:collapse}th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left}th{cursor:pointer;color:var(--mut);font-weight:600}
+.r{text-align:right}.mut{color:var(--mut)}.big{font-size:22px;font-weight:700}
+.wrap{overflow:auto;max-height:60vh}
+tr.sel{background:rgba(37,99,235,.12)}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.kpi .big{margin-top:4px}
+.err{color:var(--bad)}.okc{color:var(--ok)}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;z-index:20;padding:10px}
+.modal.show{display:flex}.box{background:var(--card);border-radius:12px;padding:16px;max-width:460px;width:100%;max-height:90vh;overflow:auto}
+.calc{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}.calc button{padding:14px}
+pre.rc{font:13px monospace;white-space:pre-wrap;margin:0}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0}.row>*{flex:0 1 auto}
+.qty{width:54px;text-align:center}
+@media print{header,main>*:not(#printarea){display:none!important}.modal{position:static;background:none}.box{max-width:none}}
+</style></head><body>
+<header><b id="bizname">🧾 POS</b>
+<nav id="nav"></nav><span style="flex:1"></span>
+<button id="calcbtn">🧮 Calc (F4)</button><button id="setbtn">⚙ Settings</button></header>
+<main id="main"></main>
+
+<div class="modal" id="m"><div class="box" id="mb"></div></div>
+<input type="file" id="file" accept=".xlsx,.xls,.csv" hidden>
+
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const peso=n=>'₱'+(Number(n)||0).toLocaleString('en-PH',{minimumFractionDigits:2,maximumFractionDigits:2});
+const num=v=>{const n=parseFloat(String(v??'').replace(/[^0-9.\-]/g,''));return isNaN(n)?0:n};
+const ld=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch{return d}};
+const sv=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){alert('Storage is full or blocked: '+e.message)}};
+
+// PRODUCT DATA (from Excel) and TRANSACTION DATA are stored separately
+let PD=ld('pos_products',{products:[],headers:[],map:{},file:''});
+let TX=ld('pos_tx',[]);
+let ST=ld('pos_settings',{biz:'BUSINESS NAME',track:true,low:5,nextNo:1});
+let cart=[],sel=-1,disc={type:'fixed',val:0},cash='',tab='sell',lastRc=null;
+let sortKey='name',sortDir=1,pq='',results=[];
+
+const TABS=[['sell','Sell'],['dash','Dashboard'],['prod','Products'],['hist','History'],['rep','Reports']];
+function nav(){ $('#nav').innerHTML=TABS.map(([k,l])=>`<button class="${tab==k?'on':''}" data-t="${k}">${l}</button>`).join('');
+ $('#bizname').textContent='🧾 '+ST.biz;
+ $('#nav').onclick=e=>{const t=e.target.dataset.t;if(t){tab=t;render()}}}
+function render(){nav();({sell:vSell,dash:vDash,prod:vProd,hist:vHist,rep:vRep})[tab]()}
+
+/* ---------- Excel import ---------- */
+$('#file').onchange=e=>{const f=e.target.files[0];e.target.value='';if(!f)return;
+ if(typeof XLSX==='undefined')return modal(`<p class="err">The Excel reader isn't loaded yet (needs internet once, or place xlsx.full.min.js beside this file). Try again in a moment.</p><button onclick="closeM()">OK</button>`);
+ const r=new FileReader();r.onload=()=>{try{
+  const wb=XLSX.read(r.result,{type:'array',cellNF:true});const ws=wb.Sheets[wb.SheetNames[0]];
+  const rows=XLSX.utils.sheet_to_json(ws,{defval:'',raw:true});
+  const rowsFmt=XLSX.utils.sheet_to_json(ws,{defval:'',raw:false});
+  if(!rows.length)throw 0;mapDialog(rows,rowsFmt,f.name)}catch(x){modal(`<p class="err">Unable to read this Excel file. Please check that the file contains valid product information.</p><button onclick="closeM()">OK</button>`)}};
+ r.readAsArrayBuffer(f)};
+function guess(h,re){return h.find(x=>re.test(String(x)))||''}
+// try the raw value first; if it doesn't yield a usable number, fall back to the formatted display text
+function numRF(raw,fmt){const a=num(raw);if(a)return a;const b=num(fmt);return b||0}
+function mapDialog(rows,rowsFmt,fname){const h=Object.keys(rows[0]);
+ const g={code:guess(h,/code|sku|barcode|item\s*#|id/i),name:guess(h,/name|item|product|desc/i),price:guess(h,/price|srp|retail|selling/i),cost:guess(h,/cost|capital/i),stock:guess(h,/stock|qty|quantity|on\s*hand/i),cat:guess(h,/categ/i),unit:guess(h,/unit|uom/i)};
+ const old=PD.map||{};const sel=k=>`<select id="mp_${k}" onchange="mpPreview()"><option value="">— none —</option>${h.map(x=>`<option ${((old[k]&&h.includes(old[k]))?old[k]:g[k])===x?'selected':''}>${esc(x)}</option>`).join('')}</select>`;
+ window._rows=rows;window._rowsFmt=rowsFmt;window._fname=fname;
+ modal(`<h3>Map columns</h3><p class="mut">${rows.length} rows found in ${esc(fname)}. Confirm which column is which.</p>
+ ${[['code','Product Code'],['name','Product Name *'],['price','Price *'],['cost','Cost'],['stock','Stock'],['cat','Category'],['unit','Unit']].map(([k,l])=>`<div class="row"><label style="width:120px">${l}</label>${sel(k)}</div>`).join('')}
+ <div id="mpprev" class="mut" style="font-size:.8rem;margin:6px 0"></div>
+ <div class="row"><button class="p" onclick="applyMap()">Import</button><button onclick="closeM()">Cancel</button></div><div id="mperr" class="err"></div>`);
+ mpPreview()}
+function mpPreview(){const get=k=>$('#mp_'+k)?.value;const n=get('name'),p=get('price');
+ const samples=window._rows.slice(0,3).map((r,i)=>{const fr=window._rowsFmt[i];
+  const nv=n?r[n]:'';const pv=p?numRF(r[p],fr?fr[p]:''):null;
+  return `${esc(String(nv))} → ${p?peso(pv):'—'}`}).join(' &nbsp;|&nbsp; ');
+ const el=$('#mpprev');if(el)el.innerHTML=`Preview: ${samples||'(pick Name and Price to preview)'}`}
+function applyMap(){const m={};['code','name','price','cost','stock','cat','unit'].forEach(k=>m[k]=$('#mp_'+k).value);
+ if(!m.name||!m.price)return $('#mperr').textContent='Please choose at least the Product Name and Price columns.';
+ const rf=window._rowsFmt;
+ const prods=window._rows.map((r,i)=>{const fr=rf[i]||{};return {id:i,code:String(r[m.code]??'').trim(),name:String(r[m.name]??'').trim(),
+  price:numRF(r[m.price],fr[m.price]),
+  cost:m.cost?numRF(r[m.cost],fr[m.cost]):null,
+  stock:m.stock&&r[m.stock]!==''?numRF(r[m.stock],fr[m.stock]):null,
+  cat:m.cat?String(r[m.cat]):'',unit:m.unit?String(r[m.unit]):'',raw:r}}).filter(p=>p.name||p.code);
+ PD={products:prods,headers:Object.keys(window._rows[0]),map:m,file:window._fname,loaded:new Date().toISOString()};sv('pos_products',PD);cart=[];closeM();render()}
+
+/* ---------- search ---------- */
+const isExpr=s=>/^[\d\s.+\-*/x×%()]+$/i.test(s)&&/[+\-*/x×%]/i.test(s)&&/\d/.test(s.trim());
+function calcExpr(s){try{let e=s.replace(/[x×]/gi,'*').replace(/(\d+\.?\d*)%/g,'($1/100)');if(!/^[\d\s.+\-*/()]+$/.test(e))return null;const v=Function('"use strict";return('+e+')')();return isFinite(v)?Math.round(v*1e8)/1e8:null}catch{return null}}
+function search(q){q=q.trim().toLowerCase();if(!q)return PD.products.slice(0,30);
+ const w=q.split(/\s+/);return PD.products.filter(p=>{const t=(p.name+' '+p.code+' '+p.cat).toLowerCase();return w.every(x=>t.includes(x))})
+ .sort((a,b)=>(b.code.toLowerCase()===q)-(a.code.toLowerCase()===q)||(b.name.toLowerCase().startsWith(q))-(a.name.toLowerCase().startsWith(q))).slice(0,50)}
+
+/* ---------- cart ---------- */
+const sub=()=>cart.reduce((s,i)=>s+i.price*i.qty,0);
+const dAmt=()=>{const s=sub();const d=disc.type=='pct'?s*Math.min(disc.val,100)/100:disc.val;return Math.min(Math.max(d,0),s)};
+const total=()=>sub()-dAmt();
+function avail(p){return ST.track&&p.stock!==null?p.stock:Infinity}
+function add(id){const p=PD.products.find(x=>x.id==id);if(!p)return;let it=cart.find(c=>c.id==id);const q=(it?it.qty:0)+1;
+ if(q>avail(p)){return msg(`Insufficient stock. Available quantity: ${avail(p)}`)}
+ if(it)it.qty=q;else cart.push({id:p.id,code:p.code,name:p.name,price:p.price,qty:1});sel=cart.findIndex(c=>c.id==id);msg('');upd()}
+function setQty(i,q){const it=cart[i];if(!it)return;q=Math.floor(num(q));const p=PD.products.find(x=>x.id==it.id);
+ if(q<=0){cart.splice(i,1);sel=-1}else if(p&&q>avail(p)){msg(`Insufficient stock. Available quantity: ${avail(p)}`);}else{it.qty=q;msg('')}upd()}
+function msg(t){const e=$('#msg');if(e)e.textContent=t}
+
+/* ---------- SELL view ---------- */
+function vSell(){
+ if(!PD.products.length){$('#main').innerHTML=`<div class="card"><h2>Welcome</h2><p>Load your Excel product list to begin. Your original file is never modified.</p><button class="p" onclick="$('#file').click()">📂 Load Excel file</button></div>`;return}
+ $('#main').innerHTML=`<div class="card"><input id="q" placeholder="Search name/code… or type a calculation like 25 x 5 (F2)" autocomplete="off" value="${esc(pq)}"><div id="qx" class="okc big"></div></div>
+ <div class="grid"><div class="card"><div class="wrap" id="res"></div></div>
+ <div class="card"><div class="wrap" style="max-height:38vh" id="cartv"></div><div id="tots"></div></div></div>`;
+ $('#q').oninput=e=>{pq=e.target.value;doSearch()};
+ $('#q').onkeydown=e=>{if(e.key=='Enter'){if(isExpr(pq)){return}if(results[0])add(results[0].id),$('#q').select()}};
+ doSearch();drawCart();drawTots()}
+function doSearch(){const qx=$('#qx');if(isExpr(pq)){const v=calcExpr(pq);qx.textContent=v===null?'':'= '+v.toLocaleString('en-PH')}else qx.textContent='';
+ results=isExpr(pq)?[]:search(pq);
+ $('#res').innerHTML=results.length?`<table><tr><th>Code</th><th>Product</th><th class="r">Price</th><th class="r">Stock</th><th></th></tr>${results.map(p=>`<tr><td>${esc(p.code)}</td><td>${esc(p.name)}</td><td class="r"><b>${peso(p.price)}</b></td><td class="r ${p.stock!==null&&p.stock<=ST.low?'err':''}">${p.stock??'—'}</td><td><button class="p" onclick="add(${p.id})">Add</button></td></tr>`).join('')}</table>`:(isExpr(pq)?'':'<p class="mut">No matching product found.</p>')}
+function drawCart(){$('#cartv').innerHTML=cart.length?`<table><tr><th>Product</th><th class="r">Price</th><th>Qty</th><th class="r">Subtotal</th><th></th></tr>${cart.map((c,i)=>`<tr class="${i==sel?'sel':''}" onclick="sel=${i};drawCart()"><td>${esc(c.name)}</td><td class="r">${peso(c.price)}</td><td><div class="row" style="margin:0;flex-wrap:nowrap"><button onclick="setQty(${i},${c.qty-1});event.stopPropagation()">−</button><input class="qty" value="${c.qty}" onclick="event.stopPropagation()" onchange="setQty(${i},this.value)"><button onclick="setQty(${i},${c.qty+1});event.stopPropagation()">+</button></div></td><td class="r">${peso(c.price*c.qty)}</td><td><button class="d" onclick="setQty(${i},0);event.stopPropagation()">Remove</button></td></tr>`).join('')}</table>`:'<p class="mut">Current sale is empty.</p>'}
+function drawTots(){const t=total(),c=num(cash),ch=c-t;
+ $('#tots').innerHTML=`<div class="row"><span>Subtotal</span><b style="margin-left:auto">${peso(sub())}</b></div>
+ <div class="row"><span>Discount</span><select id="dt"><option value="fixed" ${disc.type=='fixed'?'selected':''}>₱ amount</option><option value="pct" ${disc.type=='pct'?'selected':''}>% percent</option></select><input id="dv" type="number" min="0" style="width:90px" value="${disc.val||''}"><b style="margin-left:auto">− ${peso(dAmt())}</b></div>
+ <div class="row big"><span>TOTAL</span><span style="margin-left:auto">${peso(t)}</span></div>
+ <div class="row"><span>Cash received</span><input id="cash" type="number" min="0" style="width:130px;margin-left:auto" value="${cash}"></div>
+ <div class="row big ${cash===''?'':ch<0?'err':'okc'}"><span>${cash!==''&&ch<0?'Insufficient Payment':'Change'}</span><span style="margin-left:auto">${cash===''?'—':peso(Math.abs(ch))}</span></div>
+ ${cash!==''&&ch<0?`<div class="err">Insufficient payment. Remaining balance: ${peso(-ch)}</div>`:''}
+ <div id="msg" class="err"></div>
+ <div class="row"><button class="g" style="flex:1;padding:12px" onclick="complete()">COMPLETE SALE (F8)</button><button class="d" onclick="if(confirm('Clear current sale?')){cart=[];cash='';disc.val=0;upd()}">Clear</button></div>`;
+ $('#dt').onchange=e=>{disc.type=e.target.value;drawTots()};$('#dv').oninput=e=>{disc.val=num(e.target.value);softTots()};
+ $('#cash').oninput=e=>{cash=e.target.value;softTots()}}
+function softTots(){const a=document.activeElement.id,pos=document.activeElement.selectionStart;drawTots();const el=$('#'+a);if(el){el.focus();try{el.setSelectionRange(pos,pos)}catch{}}}
+function upd(){if(tab=='sell'){drawCart();drawTots()}}
+function complete(){if(!cart.length)return msg('Add at least one item first.');
+ const t=total(),c=num(cash);if(cash===''||c<t)return msg(`Insufficient payment. Remaining balance: ${peso(t-c)}`);
+ for(const i of cart){const p=PD.products.find(x=>x.id==i.id);if(p&&i.qty>avail(p))return msg(`Insufficient stock for ${i.name}. Available quantity: ${avail(p)}`)}
+ const now=new Date(),no=String(ST.nextNo++).padStart(6,'0');
+ const tx={no,ts:now.toISOString(),items:cart.map(i=>({...i,sub:i.price*i.qty})),subtotal:sub(),discount:dAmt(),total:t,cash:c,change:c-t};
+ if(ST.track)cart.forEach(i=>{const p=PD.products.find(x=>x.id==i.id);if(p&&p.stock!==null)p.stock-=i.qty});
+ TX.unshift(tx);sv('pos_tx',TX);sv('pos_products',PD);sv('pos_settings',ST);
+ cart=[];cash='';disc.val=0;sel=-1;showReceipt(tx)}
+
+/* ---------- Receipt ---------- */
+function rcText(t){const d=new Date(t.ts),W=32,ln='-'.repeat(W),rt=(a,b)=>a+' '.repeat(Math.max(1,W-a.length-b.length))+b;
+ return [ST.biz.toUpperCase(),'',`Transaction #${t.no}`,d.toLocaleString('en-PH'),ln,...t.items.map(i=>rt(`${i.name} x${i.qty}`,peso(i.sub))),ln,rt('Subtotal:',peso(t.subtotal)),rt('Discount:',peso(t.discount)),rt('TOTAL:',peso(t.total)),'',rt('Cash:',peso(t.cash)),rt('Change:',peso(t.change)),ln,'Thank you!'].join('\n')}
+function showReceipt(t){lastRc=t;modal(`<div id="printarea"><pre class="rc">${esc(rcText(t))}</pre></div><div class="row"><button onclick="window.print()">🖨 Print</button><button onclick="dlText('receipt-${t.no}.txt',rcText(lastRc))">⬇ Save</button><button class="p" onclick="closeM();render()">New transaction</button></div>`)}
+
+/* ---------- Dashboard ---------- */
+const sameDay=(a,b)=>new Date(a).toDateString()==new Date(b).toDateString();
+function vDash(){const td=TX.filter(t=>sameDay(t.ts,new Date())),low=PD.products.filter(p=>p.stock!==null&&p.stock<=ST.low);
+ const K=(l,v)=>`<div class="card kpi"><div class="mut">${l}</div><div class="big">${v}</div></div>`;
+ $('#main').innerHTML=`<div class="kpis">${K("TODAY'S SALES",peso(td.reduce((s,t)=>s+t.total,0)))}${K('TRANSACTIONS',td.length)}${K('ITEMS SOLD',td.reduce((s,t)=>s+t.items.reduce((a,i)=>a+i.qty,0),0))}${K('LOW STOCK',low.length)}${K('PRODUCTS',PD.products.length)}</div>
+ <div class="card"><h3>Low stock (≤ ${ST.low})</h3>${low.length?`<table>${low.slice(0,50).map(p=>`<tr><td>${esc(p.name)}</td><td class="r err">${p.stock}</td></tr>`).join('')}</table>`:'<p class="mut">Nothing low.</p>'}</div>`}
+
+/* ---------- Products ---------- */
+function vProd(){$('#main').innerHTML=`<div class="card"><div class="row"><input id="pq" placeholder="Search products…" style="flex:1"><button class="p" onclick="$('#file').click()">📂 Reload Excel</button></div><div class="mut">${esc(PD.file||'No file loaded')} · ${PD.products.length} products</div><div class="wrap" id="pt"></div></div>`;
+ $('#pq').oninput=e=>drawProd(e.target.value);drawProd('')}
+function drawProd(q){let l=q?search(q).length?PD.products.filter(p=>search(q).includes(p)):[]:PD.products.slice();
+ l.sort((a,b)=>(a[sortKey]>b[sortKey]?1:a[sortKey]<b[sortKey]?-1:0)*sortDir);const shown=l.slice(0,500);
+ const H=(k,t,r)=>`<th class="${r?'r':''}" onclick="sortKey='${k}';sortDir=${sortKey==k?-sortDir:1};drawProd($('#pq').value)">${t}${sortKey==k?(sortDir>0?' ▲':' ▼'):''}</th>`;
+ $('#pt').innerHTML=`<table><tr>${H('code','Code')}${H('name','Product Name')}${H('cat','Category')}${H('price','Price',1)}${H('cost','Cost',1)}${H('stock','Stock',1)}<th></th></tr>${shown.map(p=>`<tr><td>${esc(p.code)}</td><td>${esc(p.name)}</td><td>${esc(p.cat)}</td><td class="r">${peso(p.price)}</td><td class="r">${p.cost===null?'—':peso(p.cost)}</td><td class="r ${p.stock!==null&&p.stock<=ST.low?'err':''}">${p.stock??'—'}</td><td><button onclick="detail(${p.id})">Details</button></td></tr>`).join('')}</table>${l.length>500?`<p class="mut">Showing 500 of ${l.length}. Refine your search.</p>`:''}`}
+function detail(id){const p=PD.products.find(x=>x.id==id);modal(`<h3>${esc(p.name)}</h3><table>${Object.entries(p.raw).map(([k,v])=>`<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join('')}</table><button onclick="closeM()">Close</button>`)}
+
+/* ---------- History ---------- */
+function vHist(){$('#main').innerHTML=`<div class="card"><input id="hq" placeholder="Filter: transaction # or product…" style="width:100%"><div class="wrap" id="ht"></div></div>`;$('#hq').oninput=e=>drawHist(e.target.value);drawHist('')}
+function drawHist(q){q=q.toLowerCase().replace('#','');const l=TX.filter(t=>!q||t.no.includes(q)||t.items.some(i=>i.name.toLowerCase().includes(q)));
+ $('#ht').innerHTML=l.length?l.slice(0,300).map(t=>{const d=new Date(t.ts);return `<div class="card"><b>Transaction #${t.no}</b> <span class="mut">${d.toLocaleDateString('en-PH',{dateStyle:'long'})} ${d.toLocaleTimeString('en-PH')}</span><div>${t.items.map(i=>`${esc(i.name)} ×${i.qty} (${peso(i.sub)})`).join(', ')}</div><div>Subtotal ${peso(t.subtotal)} · Discount ${peso(t.discount)} · <b>Total ${peso(t.total)}</b> · Payment ${peso(t.cash)} · Change ${peso(t.change)}</div><button onclick="showReceipt(TX.find(x=>x.no=='${t.no}'))">Receipt</button></div>`}).join(''):'<p class="mut">No transactions found.</p>'}
+
+/* ---------- Reports ---------- */
+const iso=d=>{const x=new Date(d);return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0')};
+function vRep(){const t=new Date(),f=new Date(t.getFullYear(),t.getMonth(),1);
+ $('#main').innerHTML=`<div class="card"><div class="row"><label>From</label><input type="date" id="rf" value="${iso(f)}"><label>To</label><input type="date" id="rt" value="${iso(t)}"><select id="rg"><option value="d">Daily</option><option value="w">Weekly</option><option value="m">Monthly</option></select><button onclick="repExport('csv')">CSV</button><button onclick="repExport('xlsx')">Excel</button><button onclick="window.print()">PDF / Print</button></div><div id="printarea"><div id="rb"></div></div></div>`;
+ ['rf','rt','rg'].forEach(i=>$('#'+i).onchange=drawRep);drawRep()}
+function repRows(){const from=new Date($('#rf').value+'T00:00'),to=new Date($('#rt').value+'T23:59:59'),g=$('#rg').value,m={};
+ TX.filter(t=>{const d=new Date(t.ts);return d>=from&&d<=to}).forEach(t=>{const d=new Date(t.ts);let k;
+  if(g=='d')k=iso(d);else if(g=='m')k=iso(d).slice(0,7);else{const s=new Date(d);s.setDate(d.getDate()-d.getDay());k='Week of '+iso(s)}
+  const r=m[k]||(m[k]={period:k,tx:0,items:0,rev:0});r.tx++;r.items+=t.items.reduce((a,i)=>a+i.qty,0);r.rev+=t.total});
+ return Object.values(m).sort((a,b)=>a.period<b.period?-1:1)}
+function drawRep(){const r=repRows(),S=k=>r.reduce((a,x)=>a+x[k],0);
+ $('#rb').innerHTML=`<table><tr><th>Period</th><th class="r">Transactions</th><th class="r">Items sold</th><th class="r">Revenue</th></tr>${r.map(x=>`<tr><td>${x.period}</td><td class="r">${x.tx}</td><td class="r">${x.items}</td><td class="r">${peso(x.rev)}</td></tr>`).join('')}<tr><th>Total</th><th class="r">${S('tx')}</th><th class="r">${S('items')}</th><th class="r">${peso(S('rev'))}</th></tr></table>`}
+function repExport(f){const r=repRows().map(x=>({Period:x.period,Transactions:x.tx,'Items Sold':x.items,Revenue:x.rev}));
+ if(f=='xlsx'){if(typeof XLSX=='undefined')return alert('Excel library not loaded.');const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(r),'Sales');XLSX.writeFile(wb,'sales-report.xlsx')}
+ else dlText('sales-report.csv',['Period,Transactions,Items Sold,Revenue',...r.map(x=>`"${x.Period}",${x.Transactions},${x['Items Sold']},${x.Revenue}`)].join('\n'))}
+
+/* ---------- misc ---------- */
+function dlText(n,t){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([t],{type:'text/plain'}));a.download=n;a.click()}
+function modal(h){$('#mb').innerHTML=h;$('#m').classList.add('show')}
+function closeM(){$('#m').classList.remove('show')}
+$('#m').onclick=e=>{if(e.target.id=='m')closeM()};
+
+let cx='';
+function calc(){modal(`<h3>Calculator</h3><input id="cd" style="width:100%;font-size:22px;text-align:right" value="${cx}" autocomplete="off"><div class="big okc" id="cr" style="text-align:right;min-height:30px"></div><div class="calc">${['7','8','9','÷','4','5','6','×','1','2','3','−','0','.','%','+','C','⌫','(',')'].map(k=>`<button data-k="${k}">${k}</button>`).join('')}<button class="p" style="grid-column:span 4" data-k="=">=</button></div><button onclick="closeM()" style="margin-top:8px">Close (Esc)</button>`);
+ const d=$('#cd'),cv=()=>{const v=calcExpr(d.value.replace(/÷/g,'/').replace(/−/g,'-'));$('#cr').textContent=v===null?'':'= '+v.toLocaleString('en-PH')};
+ d.oninput=()=>{cx=d.value;cv()};d.onkeydown=e=>{if(e.key=='Enter'){const v=calcExpr(d.value.replace(/÷/g,'/').replace(/−/g,'-'));if(v!==null){d.value=cx=String(v);cv()}}};
+ $('.calc').onclick=e=>{const k=e.target.dataset.k;if(!k)return;if(k=='C')d.value='';else if(k=='⌫')d.value=d.value.slice(0,-1);else if(k=='=')d.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter'}));else d.value+=k;cx=d.value;cv()};d.focus();cv()}
+$('#calcbtn').onclick=calc;
+
+$('#setbtn').onclick=()=>modal(`<h3>Settings</h3><div class="row"><label style="width:130px">Business name</label><input id="sb" value="${esc(ST.biz)}"></div><div class="row"><label style="width:130px">Track stock</label><input type="checkbox" id="stk" ${ST.track?'checked':''}> <span class="mut">(blocks selling beyond stock)</span></div><div class="row"><label style="width:130px">Low stock at ≤</label><input type="number" id="sl" value="${ST.low}" style="width:80px"></div><div class="row"><button class="p" onclick="ST.biz=$('#sb').value||'BUSINESS NAME';ST.track=$('#stk').checked;ST.low=num($('#sl').value);sv('pos_settings',ST);closeM();render()">Save</button><button class="d" onclick="if(confirm('Delete ALL transaction history? Products are kept.')){TX=[];ST.nextNo=1;sv('pos_tx',TX);sv('pos_settings',ST);closeM();render()}">Clear transactions</button></div><p class="mut">Data is stored in this browser on this computer. Use Reports → Excel/CSV for backups.</p>`);
+
+document.addEventListener('keydown',e=>{const typing=/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
+ if(e.key=='F2'){e.preventDefault();tab='sell';render();$('#q')?.focus()}
+ else if(e.key=='F4'){e.preventDefault();calc()}
+ else if(e.key=='F8'){e.preventDefault();if(tab=='sell')complete()}
+ else if(e.key=='Escape')closeM();
+ else if(!typing&&tab=='sell'&&sel>=0&&cart[sel]){if(e.key=='Delete')setQty(sel,0);else if(e.key=='+'||e.key=='=')setQty(sel,cart[sel].qty+1);else if(e.key=='-')setQty(sel,cart[sel].qty-1)}});
+render();
+</script></body></html>
